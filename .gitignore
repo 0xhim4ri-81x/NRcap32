@@ -1,0 +1,4 @@
+firmware/.vscode/settings.json
+firmware/compile_commands.json
+firmware/.cache/clangd/compile_commands.json
+firmware/.vscode/extensions.json
